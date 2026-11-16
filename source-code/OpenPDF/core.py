@@ -321,20 +321,32 @@ class PDF:
         return [(i, w.field_name, w.field_value, w.field_type, list(w.choice_values or []))
                 for i, p in enumerate(self.doc) for w in (p.widgets() or [])]
 
+    _FILLABLE = (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                 fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX)
+
+    def _field_answer(self, widget, value, own_on_state=False):
+        # The value a field takes for an answer; one rule for Fill fields and Import data.
+        if widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+            answer, on = str(value).lower(), widget.on_state()
+            # Exported data names a ticked box by its own on-state, which need not be a yes word.
+            ticked = answer in ('yes', 'true', '1', 'on') or (own_on_state and answer == str(on).lower())
+            return on if ticked else 'Off'
+        if widget.field_type in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+            # An option is a name or, in forms from other tools, an (export, display) pair.
+            options = [(o, o) if isinstance(o, str) else tuple(o) for o in (widget.choice_values or [])]
+            # An editable dropdown also holds text typed outside its options.
+            typed = (widget.field_type == fitz.PDF_WIDGET_TYPE_COMBOBOX
+                     and (widget.field_flags or 0) & fitz.PDF_CH_FIELD_IS_EDIT)
+            if value and options and not typed and not any(value in option for option in options):
+                raise ValueError(f'{value!r} is not one of: {", ".join(str(o[-1]) for o in options)}')
+        return value
+
     def fill_field(self, index, name, value):
         for w in self.doc[index].widgets() or []:
             if w.field_name == name:
-                if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                    w.field_value = w.on_state() if str(value).lower() in ('yes', 'true', '1', 'on') else 'Off'
-                elif w.field_type == fitz.PDF_WIDGET_TYPE_TEXT:
-                    w.field_value = value
-                elif w.field_type in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
-                    options = w.choice_values or []
-                    if value and options and value not in options:
-                        raise ValueError(f'{value!r} is not one of: {", ".join(options)}')
-                    w.field_value = value
-                else:
+                if w.field_type not in self._FILLABLE:
                     raise ValueError('This field type cannot be filled here.')
+                w.field_value = self._field_answer(w, value)
                 w.update()
                 return
         raise ValueError('Field not found.')
@@ -361,11 +373,20 @@ class PDF:
         ET.ElementTree(root).write(str(path), encoding='utf-8', xml_declaration=True)
         return count
 
-    def import_form_data(self, path):
+    def import_form_data(self, path, refused=None):
         # Accept XFDF from OpenPDF or Acrobat (namespaced or not) and apply by name.
+        # A value its field cannot hold is skipped and added to `refused` as (name, reason);
+        # the other values still apply. Returns the number of fields set.
         import xml.etree.ElementTree as ET
         local = lambda tag: tag.rsplit('}', 1)[-1]
-        tree = ET.parse(str(path))  # local, user-selected file
+        try:
+            tree = ET.parse(str(path))  # local, user-selected file
+        except (ET.ParseError, ValueError, LookupError):  # not XML, cut off, or wrongly encoded
+            raise ValueError('This is not an XFDF file.') from None
+        # The root element decides: other XML can hold <field> elements too (a database dump, a web form),
+        # and an XFDF with no fields (an empty form's export) is still XFDF.
+        if local(tree.getroot().tag) != 'xfdf':
+            raise ValueError('This is not an XFDF file.')
         values = {}
         for element in tree.iter():
             if local(element.tag) == 'field' and element.get('name'):
@@ -376,11 +397,12 @@ class PDF:
             for w in (page.widgets() or []):
                 if w.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE or w.field_name not in values:
                     continue
-                val = values[w.field_name]
-                if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                    w.field_value = w.on_state() if val not in ('', 'Off', 'off') else 'Off'
-                else:
-                    w.field_value = val
+                try:
+                    w.field_value = self._field_answer(w, values[w.field_name], own_on_state=True)
+                except ValueError as error:
+                    if refused is not None:
+                        refused.append((w.field_name, str(error)))
+                    continue
                 w.update()
                 applied += 1
         return applied
