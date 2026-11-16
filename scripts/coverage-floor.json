@@ -1,0 +1,9 @@
+{
+  "floors": {
+    "OpenPDF": { "covered": 1088, "lines": 4661 },
+    "OpenPDF without Tesseract": { "covered": 1066, "lines": 4661 },
+    "OpenSlides": { "covered": 146, "lines": 8654 },
+    "OpenSlides desktop": { "covered": 40, "lines": 133 },
+    "Launcher": { "covered": 7, "lines": 111 }
+  }
+}
