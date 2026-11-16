@@ -4,7 +4,10 @@ import datetime
 import difflib
 import html
 import io
+import multiprocessing
+import multiprocessing.connection
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,72 @@ def page_numbers(spec, count):
     if not result or any(p < 0 or p >= count for p in result):
         raise ValueError(f'Enter pages between 1 and {count}, e.g. 1,3-5.')
     return result
+
+
+def _optimize_worker(conn, data, options):
+    try:
+        conn.send((True, PDF.optimize_data(data, **options)))
+    except Exception as exc:
+        conn.send((False, str(exc)))
+
+
+class OptimizeJob:
+    """PDF.optimize_data in a process of its own. MuPDF keeps the interpreter
+    lock while it rewrites images, so a thread would still freeze the window."""
+
+    def __init__(self, data, options):
+        context = multiprocessing.get_context('spawn')  # fork is unsafe beside Tk and threads
+        self.conn, self.child = context.Pipe(duplex=False)
+        self.process = context.Process(target=_optimize_worker, args=(self.child, data, options), daemon=True)
+        self.started = self.cancelled = False
+
+    def result(self, timeout=None):
+        """Wait for (bytes, images, reduced), or None once cancelled. Blocks: call it off the window thread."""
+        try:
+            if self.cancelled:
+                return None
+            # The document travels with the start-up data, which a worker that dies early
+            # refuses. Nothing is written to the result pipe from this side: on Windows the
+            # worker's end stays open here until the worker takes it, so a write to a worker
+            # stopped before that would wait for ever.
+            self.process.start()
+            self.started = True
+            # The worker has its own copy of its end. With this one closed, a worker that
+            # dies part-way through sending its result ends the read below instead of
+            # leaving it waiting for the rest.
+            self.child.close()
+            if self.cancelled:  # cancel() came while the worker was starting
+                self.process.terminate()
+            # On Windows a worker that dies before taking its end leaves the pipe open: watch the process too.
+            ready = multiprocessing.connection.wait([self.conn, self.process.sentinel], timeout)
+            if not ready:
+                self.process.terminate()
+                raise RuntimeError(f'The optimizer did not finish within {timeout:g} seconds.')
+            if self.conn not in ready and not self.conn.poll(0):
+                raise EOFError
+            ok, value = self.conn.recv()
+            if self.cancelled:  # cancel() came as the result arrived
+                return None
+        except (EOFError, OSError, pickle.UnpicklingError):  # no result, or only part of one
+            if self.cancelled:
+                return None
+            raise RuntimeError('The optimizer stopped unexpectedly.') from None
+        finally:
+            self.conn.close()
+            self.child.close()
+            if self.started:
+                self.process.join(5)
+                if self.process.is_alive():
+                    self.process.kill()
+                    self.process.join(5)
+        if not ok:
+            raise RuntimeError(value)
+        return value
+
+    def cancel(self):
+        self.cancelled = True
+        if self.started:
+            self.process.terminate()
 
 
 class PDF:
@@ -100,27 +169,41 @@ class PDF:
     def current_size(self):
         return len(self.doc.tobytes(garbage=4, deflate=True))
 
-    def optimized_bytes(self, dpi=120, quality=70, downsample_images=True,
-                        subset_fonts=True, strip_metadata=False):
-        # Work on a copy so the open document is never mutated by optimization.
-        work = fitz.open('pdf', self.doc.tobytes())
+    @staticmethod
+    def optimize_data(data, dpi=120, quality=70, downsample_images=True,
+                      subset_fonts=True, strip_metadata=False):
+        """Optimize PDF bytes. Returns (bytes, images, reduced): how many page
+        images there are and how many of them came out with fewer pixels."""
+        work = fitz.open('pdf', data)
         try:
             if strip_metadata:
                 work.set_metadata({})
                 work.del_xml_metadata()
+            images = reduced = 0
             if downsample_images:
+                def sizes():
+                    return [image[2:4] for page in work for image in page.get_images()]
+                before = sizes()
                 # Downsample images meaningfully above the target DPI (Acrobat uses
                 # a ~1.5x threshold) down to it, re-encoding at the chosen quality.
+                # MuPDF only halves an image, and only while half stays at or above
+                # the target: a 200 DPI scan is left alone at 120 DPI.
                 work.rewrite_images(dpi_threshold=max(dpi + 1, round(dpi * 1.5)), dpi_target=dpi,
                                     quality=quality, lossy=True, lossless=True)
+                images = len(before)
+                reduced = sum(a != b for a, b in zip(before, sizes()))
             if subset_fonts:
                 try:
                     work.subset_fonts()
                 except Exception:
                     pass  # subsetting can fail on unusual fonts; skip rather than abort
-            return work.tobytes(garbage=4, deflate=True, clean=True)
+            return work.tobytes(garbage=4, deflate=True, clean=True), images, reduced
         finally:
             work.close()
+
+    def optimized_bytes(self, **options):
+        # Work on a copy so the open document is never mutated by optimization.
+        return self.optimize_data(self.doc.tobytes(), **options)[0]
 
     def optimize(self, path, **options):
         data = self.optimized_bytes(**options)
