@@ -12,7 +12,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog as fd, simpledialog as sd, messagebox as mb, colorchooser
 from pathlib import Path
 import webbrowser
-from versions import save_version, list_versions, read_version, delete_version, version_file
+from versions import (save_version, list_versions, read_version, delete_version, version_file, next_removal,
+                      usage, shared_files, clear_history, orphans, clear_orphan, remember_path, LIMIT as VERSION_LIMIT)
 
 # Windowed executables have no standard streams. Some conversion dependencies
 # write progress output; give them a real stream and retain diagnostic failures.
@@ -47,6 +48,18 @@ from ui_tools import enable_dpi_awareness
 from studio_ui import build_workspace
 
 
+def save_snapshot(app, label, confirm=None):
+    """Save Version history's copy of the open document; no change since the
+    newest version adds nothing, and a state an older version holds shares its
+    file (see versions.save_version). With a password the content is
+    recognised before the slow encrypted copy is made, so a state already
+    stored costs no encryption."""
+    if app.password:
+        return save_version(app.path, lambda: app.pdf.snapshot_bytes(app.password), label,
+                            key=app.pdf.snapshot_key(app.password), confirm=confirm)
+    return save_version(app.path, app.pdf.snapshot_bytes(), label, confirm=confirm)
+
+
 class App(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()
@@ -55,6 +68,7 @@ class App(tk.Tk):
         self.geometry(f'{min(1440, self.winfo_screenwidth()-24)}x{min(900, self.winfo_screenheight()-100)}')
         self.minsize(1000, 650)
         self.pdf = None
+        self.password = ''  # of the open document; memory only, protects its saved versions
         self.path = None
         self.index = 0
         self.zoom = 1.0
@@ -135,7 +149,7 @@ class App(tk.Tk):
         loaded = PDF(path, password)
         if self.pdf:
             self.pdf.close()
-        self.pdf, self.path = loaded, path
+        self.pdf, self.path, self.password = loaded, path, password
         self.history, self.redo_history, self.index, self.dirty = [], [], 0, False
         self.search_query = ''
         self.refresh()
@@ -154,6 +168,7 @@ class App(tk.Tk):
         if self.pdf:
             self.pdf.close()
         self.pdf = PDF()
+        self.password = ''
         self.pdf.doc.new_page()
         self.pdf.restore(self.pdf.bytes())  # gives undo a base now, so the first edit does not reopen the document
         self.path, self.history, self.redo_history, self.index, self.dirty = None, [], [], 0, True
@@ -170,6 +185,7 @@ class App(tk.Tk):
             self.pdf.save(path)
             self.dirty = False
             self.path = path
+            self.password = ''  # the file now at self.path is unencrypted
             self.update_document_header()
             self.status.set(f'Saved {path}. Export is unencrypted; use Password export to encrypt.')
 
@@ -1125,78 +1141,199 @@ class App(tk.Tk):
 
     def _restore_version(self, version_id):
         # Snapshot the current state first, and record an in-memory undo step, so
-        # a restore can be reversed.
-        save_version(self.path, self.pdf.doc.tobytes(garbage=4, deflate=True), 'Before restore')
-        data = read_version(self.path, version_id)
-        self.history.append(self.pdf.bytes())
+        # a restore can be reversed. The document is replaced last: a version that
+        # cannot be unlocked, or a snapshot that cannot be written, changes nothing.
+        # A current state equal to the newest version adds nothing; one an older
+        # version holds adds an entry sharing that version's file.
+        replacement = PDF.unlocked(read_version(self.path, version_id), self.password)
+        try:
+            undo_step = self.pdf.bytes()
+            save_snapshot(self, 'Before restore')
+        except BaseException:
+            replacement.close()
+            raise
+        self.pdf.replace(replacement)
+        self.history.append(undo_step)
         self.history = self.history[-8:]
         self.redo_history.clear()
-        self.pdf.restore(data)
         self.dirty = True
         self.refresh()
         self.status.set('Version restored. Undo to go back, or Save as to keep it.')
+
+    @staticmethod
+    def _size_text(size):
+        if size >= 104858:
+            return f'{size / 1048576:.1f} MB'
+        return f'{max(1, round(size / 1024))} KB' if size > 0 else '0 KB'
+
+    @staticmethod
+    def _version_text(record):
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(record['created']))
+        return f"\"{record['label'] or 'Untitled version'}\" ({when})"
 
     def version_history(self):
         self.require()
         if not self.path:
             raise ValueError('Save the document first (Save as) to keep a version history.')
+        remember_path(self.path)
         window = tk.Toplevel(self)
         window.title('Version history')
         window.transient(self)
-        window.geometry('640x420')
+        window.geometry('700x480')
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Snapshots of this document stay on this computer. Save a version, '
-                             'then restore or compare it later.', style='Muted.TLabel', wraplength=600).pack(anchor='w')
+        ttk.Label(frame, text='Snapshots of this document stay on this computer'
+                             + (", protected with the document's password" if self.password else '')
+                             + '. Save a version, then restore or compare it later.', style='Muted.TLabel', wraplength=660).pack(anchor='w')
+        ttk.Label(frame, text=f'At most {VERSION_LIMIT} versions are kept. When there are {VERSION_LIMIT}, saving another '
+                             '(including the copy Restore saves first) deletes the oldest; you are asked first. '
+                             'Saving with nothing changed since the newest version adds nothing; saving a state '
+                             'an older version holds adds a new entry that shares its copy and deletes no saved state.',
+                  style='Muted.TLabel', wraplength=660).pack(anchor='w', pady=(4, 0))
         saver = ttk.Frame(frame)
         saver.pack(fill='x', pady=8)
         label = tk.StringVar()
         ttk.Entry(saver, textvariable=label).pack(side='left', fill='x', expand=True)
-        tree = ttk.Treeview(frame, columns=('when', 'label', 'pages'), show='headings', height=11)
-        for col, head, width in [('when', 'Saved', 150), ('label', 'Label', 320), ('pages', 'Pages', 70)]:
+        tree = ttk.Treeview(frame, columns=('when', 'label', 'pages', 'size'), show='headings', height=11)
+        for col, head, width in [('when', 'Saved', 140), ('label', 'Label', 300), ('pages', 'Pages', 60), ('size', 'Size', 130)]:
+            tree.heading(col, text=head)
+            tree.column(col, width=width, anchor='w')
+        total = tk.StringVar()
+        rows = {}
+        def reload():
+            tree.delete(*tree.get_children())
+            rows.clear()
+            shared = shared_files(self.path)
+            for record in list_versions(self.path):
+                when = time.strftime('%Y-%m-%d %H:%M', time.localtime(record['created']))
+                size = self._size_text(record.get('bytes', 0))
+                if shared.get(version_file(self.path, record['id']).name, 0) > 1:
+                    size += ' (shared)'
+                row = tree.insert('', 'end', values=(when, record['label'] or 'Untitled version', record['pages'], size))
+                rows[row] = record
+            count, used = usage(self.path)
+            total.set(f'{count} of {VERSION_LIMIT} versions, {self._size_text(used)} on disk.')
+        def selected():
+            item = rows.get(tree.focus())
+            if not item:
+                raise ValueError('Select a version in the list first.')
+            return item
+        def removal_note(gone=None):
+            gone = next_removal(self.path) if gone is None else gone
+            return (f'There are already {VERSION_LIMIT} versions, the most kept, so this deletes the oldest: '
+                    + ', '.join(self._version_text(r) for r in gone) + '.') if gone else ''
+        def save():
+            # Asked only once the state is known to be new: an unchanged save deletes nothing.
+            deleted = []
+            def confirm(gone):
+                deleted.extend(gone)
+                return not gone or mb.askyesno('Save version', removal_note(gone) + ' Continue?', parent=window)
+            record = save_snapshot(self, label.get(), confirm=confirm)
+            if record is None:
+                return
+            if record.get('unchanged'):
+                note = f'Nothing changed since {self._version_text(record)}; that version already holds this state, so nothing was added.'
+                self.status.set(note)
+                mb.showinfo('Save version', note, parent=window)
+                return
+            if record.get('same_as'):
+                note = (f'Saved. This state is the same as {self._version_text(record["same_as"])}, '
+                        'so the new version shares that copy on disk.'
+                        + (f' That older entry was removed from the list (at most {VERSION_LIMIT} entries); '
+                           'its state is kept under the new one.' if record.get('replaced') else ''))
+                label.set('')
+                reload()
+                self.status.set(note)
+                return
+            label.set('')
+            reload()
+            self.status.set('Version saved.' + (' The oldest version was deleted.' if deleted else ''))
+        def restore():
+            item = selected()
+            note = removal_note()
+            if mb.askyesno('Restore version', 'Replace the current document with this version? Your current '
+                                              'state is saved as a version first, and Undo brings it back.'
+                                              + (f'\n\nIf the current state is not already a kept version: {note}' if note else ''),
+                           parent=window):
+                self._restore_version(item['id'])
+                reload()
+        def compare():
+            item = selected()
+            out = Path(tempfile.mkdtemp()) / 'version-diff.html'
+            self.pdf.compare(str(version_file(self.path, item['id'])), str(out), self.password)
+            webbrowser.open(out.resolve().as_uri())
+        def delete():
+            item = selected()
+            delete_version(self.path, item['id'])
+            reload()
+        def clear():
+            count, used = usage(self.path)
+            if mb.askyesno('Clear history', f'Delete all {count} saved versions of this document '
+                                            f'({self._size_text(used)})? This cannot be undone.', parent=window):
+                clear_history(self.path)
+                reload()
+                self.status.set('Version history cleared.')
+        ttk.Button(saver, text='Save version', command=lambda: self.guard(save)).pack(side='left', padx=(8, 0))
+        # Bottom rows are packed before the list so a small window shrinks the list, not the buttons.
+        buttons = ttk.Frame(frame)
+        buttons.pack(side='bottom', fill='x')
+        ttk.Button(buttons, text='Compare with current', command=lambda: self.guard(compare)).pack(side='left')
+        ttk.Button(buttons, text='Restore', command=lambda: self.guard(restore)).pack(side='left', padx=6)
+        ttk.Button(buttons, text='Delete', command=lambda: self.guard(delete)).pack(side='left')
+        ttk.Button(buttons, text='Close', command=window.destroy).pack(side='right')
+        space = ttk.Frame(frame)
+        space.pack(side='bottom', fill='x', pady=(4, 8))
+        ttk.Label(space, textvariable=total, style='Muted.TLabel').pack(side='left')
+        ttk.Button(space, text='Moved or deleted files…',
+                   command=lambda: self.guard(lambda: self.orphaned_histories(window))).pack(side='right')
+        ttk.Button(space, text='Clear history', command=lambda: self.guard(clear)).pack(side='right', padx=6)
+        tree.pack(fill='both', expand=True, pady=(4, 0))
+        reload()
+        window.grab_set()
+
+    def orphaned_histories(self, parent):
+        # Histories of documents that were renamed, moved or deleted are listed
+        # nowhere else; show them with their size so they can be cleared.
+        window = tk.Toplevel(parent)
+        window.title('Histories of moved or deleted files')
+        window.transient(parent)
+        window.geometry('640x340')
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='Saved versions of documents that are no longer at the place they were saved from. '
+                             '"Location not recorded" means it was saved by an older OpenPDF and its document may still exist; '
+                             'opening Version history from that document removes it from this list.', style='Muted.TLabel', wraplength=600).pack(anchor='w')
+        tree = ttk.Treeview(frame, columns=('doc', 'folder', 'versions', 'size'), show='headings', height=9)
+        for col, head, width in [('doc', 'Document', 170), ('folder', 'Was in', 250), ('versions', 'Versions', 70), ('size', 'Size', 80)]:
             tree.heading(col, text=head)
             tree.column(col, width=width, anchor='w')
         rows = {}
         def reload():
             tree.delete(*tree.get_children())
             rows.clear()
-            for record in list_versions(self.path):
-                when = time.strftime('%Y-%m-%d %H:%M', time.localtime(record['created']))
-                row = tree.insert('', 'end', values=(when, record['label'] or 'Untitled version', record['pages']))
-                rows[row] = record
-        def selected():
+            for item in orphans(exclude=self.path):
+                where = Path(item['path']) if item['path'] else None
+                values = ((where.name, str(where.parent)) if where else
+                          (item['source'] or 'Unknown', 'Location not recorded'))
+                rows[tree.insert('', 'end', values=values + (item['versions'], self._size_text(item['bytes'])))] = item
+        def clear():
             item = rows.get(tree.focus())
             if not item:
-                raise ValueError('Select a version in the list first.')
-            return item
-        def save():
-            save_version(self.path, self.pdf.doc.tobytes(garbage=4, deflate=True), label.get())
-            label.set('')
-            reload()
-            self.status.set('Version saved.')
-        def restore():
-            item = selected()
-            if mb.askyesno('Restore version', 'Replace the current document with this version? Your current '
-                                              'state is saved as a version first, and Undo brings it back.', parent=self):
-                self._restore_version(item['id'])
+                raise ValueError('Select a history in the list first.')
+            if mb.askyesno('Clear history', f"Delete the {item['versions']} saved versions of "
+                                            f"{item['path'] or item['source']} ({self._size_text(item['bytes'])})? "
+                                            'This cannot be undone.', parent=window):
+                clear_orphan(item['folder'])
                 reload()
-        def compare():
-            item = selected()
-            out = Path(tempfile.mkdtemp()) / 'version-diff.html'
-            self.pdf.compare(str(version_file(self.path, item['id'])), str(out))
-            webbrowser.open(out.resolve().as_uri())
-        def delete():
-            item = selected()
-            delete_version(self.path, item['id'])
-            reload()
-        ttk.Button(saver, text='Save version', command=lambda: self.guard(save)).pack(side='left', padx=(8, 0))
-        tree.pack(fill='both', expand=True, pady=(4, 8))
         buttons = ttk.Frame(frame)
-        buttons.pack(fill='x')
-        ttk.Button(buttons, text='Compare with current', command=lambda: self.guard(compare)).pack(side='left')
-        ttk.Button(buttons, text='Restore', command=lambda: self.guard(restore)).pack(side='left', padx=6)
-        ttk.Button(buttons, text='Delete', command=lambda: self.guard(delete)).pack(side='left')
-        ttk.Button(buttons, text='Close', command=window.destroy).pack(side='right')
+        buttons.pack(side='bottom', fill='x')
+        tree.pack(fill='both', expand=True, pady=8)
+        def close():
+            window.destroy()
+            parent.grab_set()  # the history dialog stays modal
+        ttk.Button(buttons, text='Clear', command=lambda: self.guard(clear)).pack(side='left')
+        ttk.Button(buttons, text='Close', command=close).pack(side='right')
+        window.protocol('WM_DELETE_WINDOW', close)
         reload()
         window.grab_set()
 
