@@ -3,16 +3,49 @@ import { Copy, Download, FolderOpen, Plus, Trash2 } from 'lucide-react';
 import type { Deck } from '../model/types';
 import { TEMPLATES, createFromTemplate } from '../model/templates';
 import { SlideView } from '../render/SlideView';
-import { deleteDeck, listDecks, saveDeck } from '../store/storage';
+import { deleteDeck, deleteStoredDeck, listStoredDecks, saveDeck, type StoredDeck } from '../store/storage';
 import { exportDeckFile, readDeckFile, DECK_FILE_EXT } from '../io/deckfile';
 import { navigate } from '../router';
 import { uid } from '../model/factory';
+import { deckProblem } from '../model/validate';
+import { ErrorBoundary } from '../ErrorBoundary';
 
 function Thumb({ deck, width }: { deck: Deck; width: number }) {
   const slide = deck.slides[0] ?? null;
   return (
     <div className="thumb-wrap" style={{ width, height: (width * deck.size.h) / deck.size.w }}>
       <SlideView deck={deck} slide={slide} mode="thumb" scale={width / deck.size.w} index={0} />
+    </div>
+  );
+}
+
+/** A saved deck that can't be drawn: no thumbnail and no way in, but it can be downloaded or deleted. */
+function DamagedCard({ deck, onDelete }: { deck: Deck; onDelete: () => void }) {
+  const title = typeof deck.title === 'string' && deck.title ? deck.title : 'Untitled deck';
+  return (
+    <div className="deck-card">
+      <div className="deck-damaged">This deck is damaged and can’t be opened.</div>
+      <div className="deck-meta">
+        <div>
+          <div className="deck-title">{title}</div>
+          <div className="muted small">Damaged</div>
+        </div>
+        <div className="deck-actions">
+          <button className="icon-btn" title="Download deck file" aria-label={`Download deck file of ${title}`} onClick={() => exportDeckFile({ ...deck, title })}>
+            <Download size={15} />
+          </button>
+          <button
+            className="icon-btn danger"
+            title="Delete"
+            aria-label={`Delete damaged deck ${title}`}
+            onClick={() => {
+              if (confirm(`Delete “${title}”? This can’t be undone.`)) onDelete();
+            }}
+          >
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -26,13 +59,14 @@ function timeAgo(t: number) {
 }
 
 export function Home() {
-  const [decks, setDecks] = useState<Deck[] | null>(null);
+  const [decks, setDecks] = useState<StoredDeck[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const previews = useMemo(() => TEMPLATES.map((t) => ({ t, deck: createFromTemplate(t.id) })), []);
+  const damaged = useMemo(() => new Set((decks ?? []).map((e) => e.deck).filter((d) => deckProblem(d, { stored: true }))), [decks]);
 
-  const refresh = () => listDecks().then(setDecks).catch(() => setError('This browser blocked local storage, so decks can’t be saved. Turn off private browsing and reload.'));
+  const refresh = () => listStoredDecks().then(setDecks).catch(() => setError('This browser blocked local storage, so decks can’t be saved. Turn off private browsing and reload.'));
   useEffect(() => {
     refresh();
     document.title = 'OpenSlides';
@@ -128,10 +162,21 @@ export function Home() {
           </div>
         ) : (
           <div className="deck-grid">
-            {decks.map((d) => (
-              <div key={d.id} className="deck-card">
+            {decks.map(({ key, deck: d }) => damaged.has(d) ? (
+              <DamagedCard
+                key={key}
+                deck={d}
+                onDelete={async () => {
+                  await deleteStoredDeck(key);
+                  refresh();
+                }}
+              />
+            ) : (
+              <div key={key} className="deck-card">
                 <button className="deck-open" onClick={() => navigate(`#/d/${d.id}`)} aria-label={`Open ${d.title}`}>
-                  <Thumb deck={d} width={260} />
+                  <ErrorBoundary fallback={<div className="deck-damaged">This deck can’t be previewed.</div>}>
+                    <Thumb deck={d} width={260} />
+                  </ErrorBoundary>
                 </button>
                 <div className="deck-meta">
                   <div>
