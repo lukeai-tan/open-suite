@@ -34,12 +34,12 @@ elif sys.stdout is None or sys.stderr is None:
 
 import fitz
 from PIL import Image, ImageTk
-from core import PDF, page_numbers, images_to_pdf, office_to_pdf
+from core import PDF, page_numbers, images_to_pdf, office_to_pdf, removed_summary
 from text_tools import find_matches, replace_match, select_text, lines
 from box_tools import text_sections
 from inline_editor import InlineEditor
 from rich_editor import RichBoxEditor
-from rich_boxes import boxes, new_box, move_page, apply_redactions
+from rich_boxes import boxes, new_box, move_page
 from thumbnails import Thumbnails
 from pen_tools import add_stroke
 from render_tools import PageCache, pixmap_image
@@ -965,20 +965,18 @@ class App(tk.Tk):
 
     def redact(self):
         self.require()
+        removed = []
+        overlays = 'Form fields and comments (notes, highlights, stamps, drawings) that touch it are removed whole.'
         if self.text_quads:
             quads = list(self.text_quads)
-            if mb.askyesno('Redact selected text', 'Permanently remove the selected characters in the exported PDF?', parent=self):
-                def remove():
-                    page = self.pdf.doc[self.index]
-                    for quad in quads:
-                        r = quad.rect + (0.05, 0.05, -0.05, -0.05)
-                        page.add_redact_annot(r, fill=(0, 0, 0))
-                    apply_redactions(page, images=0, graphics=0, text=0)
-                self.change(remove, 'Selected text redacted. Save as to export the cleaned PDF.', dirty_pages={self.index})
+            if mb.askyesno('Redact selected text', f'Permanently remove the selected characters in the exported PDF? {overlays}', parent=self):
+                self.change(lambda: removed.append(self.pdf.redact_quads(self.index, quads)), 'Selected text redacted.', dirty_pages={self.index})
+                self.status.set(f'Selected text redacted. {removed_summary(*removed[0])}Save as to export the cleaned PDF.')
             return
         rect = self.rect()
-        if mb.askyesno('Redact', 'Remove text, image pixels, and intersecting graphics in this area? Save as a new file afterward.', parent=self):
-            self.change(lambda: self.pdf.redact(self.index, rect), 'Area redacted. Save as to write a cleaned PDF. Other copies and metadata are separate.')
+        if mb.askyesno('Redact', f'Remove text, image pixels, and intersecting graphics in this area? {overlays} Save as a new file afterward.', parent=self):
+            self.change(lambda: removed.append(self.pdf.redact(self.index, rect)), 'Area redacted.')
+            self.status.set(f'Area redacted. {removed_summary(*removed[0])}Save as to write a cleaned PDF. Other copies and metadata are separate.')
 
     def sanitize(self):
         self.require()
