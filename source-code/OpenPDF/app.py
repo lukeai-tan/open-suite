@@ -55,6 +55,7 @@ class App(tk.Tk):
         self.geometry(f'{min(1440, self.winfo_screenwidth()-24)}x{min(900, self.winfo_screenheight()-100)}')
         self.minsize(1000, 650)
         self.pdf = None
+        self.password = ''  # of the open document; memory only, protects its saved versions
         self.path = None
         self.index = 0
         self.zoom = 1.0
@@ -135,11 +136,25 @@ class App(tk.Tk):
         loaded = PDF(path, password)
         if self.pdf:
             self.pdf.close()
-        self.pdf, self.path = loaded, path
+        self.pdf, self.path, self.password = loaded, path, password
         self.history, self.redo_history, self.index, self.dirty = [], [], 0, False
         self.search_query = ''
         self.refresh()
         self.status.set(f'Opened {Path(path).name}. Drag to select text; switch to Select area for placement/cropping.')
+
+    def ask_password(self, path):
+        # For a file a tool is about to read. Window thread only: it may open a
+        # dialog. '' for an unprotected file, which is not asked about; None
+        # when the user cancels, which the caller treats like cancelling Open.
+        if not PDF.locked(path):
+            return ''
+        name = Path(path).name
+        password = sd.askstring('Password', f'Password for {name}:', show='*', parent=self)
+        if password is None:
+            return None
+        if PDF.locked(path, password):
+            raise ValueError(f'{name} was not opened: that is not its password.')
+        return password
 
     def open(self):
         if not self.confirm_discard():
@@ -154,6 +169,7 @@ class App(tk.Tk):
         if self.pdf:
             self.pdf.close()
         self.pdf = PDF()
+        self.password = ''
         self.pdf.doc.new_page()
         self.pdf.restore(self.pdf.bytes())  # gives undo a base now, so the first edit does not reopen the document
         self.path, self.history, self.redo_history, self.index, self.dirty = None, [], [], 0, True
@@ -170,6 +186,7 @@ class App(tk.Tk):
             self.pdf.save(path)
             self.dirty = False
             self.path = path
+            self.password = ''  # the file now at self.path is unencrypted
             self.update_document_header()
             self.status.set(f'Saved {path}. Export is unencrypted; use Password export to encrypt.')
 
@@ -510,7 +527,12 @@ class App(tk.Tk):
         self.require()
         paths = fd.askopenfilenames(filetypes=[('PDF', '*.pdf')])
         if paths:
-            self.change(lambda: self.pdf.merge(paths))
+            passwords = {}
+            for path in paths:
+                passwords[path] = self.ask_password(path)
+                if passwords[path] is None:
+                    return  # cancelled: nothing is added
+            self.change(lambda: self.pdf.merge(paths, passwords))
 
     def select(self):
         self.require()
@@ -1117,21 +1139,44 @@ class App(tk.Tk):
     def compare(self):
         self.require()
         other = fd.askopenfilename(filetypes=[('PDF', '*.pdf')])
+        password = self.ask_password(other) if other else ''
+        if password is None:
+            return  # cancelled
         path = self.output('.html') if other else None
         if path:
-            self.pdf.compare(other, path)
-            webbrowser.open(Path(path).resolve().as_uri())
+            self.compare_in_background(other, path, password)
+
+    def compare_in_background(self, other, output, password=''):
+        # A long document takes seconds to compare: work on a copy, off the
+        # window thread, so the window keeps responding.
+        snapshot = self.pdf.bytes()
+        def work():
+            worker = PDF()
+            try:
+                worker.restore(snapshot)
+                worker.compare(other, output, password)
+            finally:
+                worker.close()
+        def done(_):
+            webbrowser.open(Path(output).resolve().as_uri())
             self.status.set('Text comparison opened. Image/layout changes are not included; OCR scans first.')
+        self.background(work, done, 'Comparing text…')
 
     def _restore_version(self, version_id):
         # Snapshot the current state first, and record an in-memory undo step, so
-        # a restore can be reversed.
-        save_version(self.path, self.pdf.doc.tobytes(garbage=4, deflate=True), 'Before restore')
-        data = read_version(self.path, version_id)
-        self.history.append(self.pdf.bytes())
+        # a restore can be reversed. The document is replaced last: a version that
+        # cannot be unlocked, or a snapshot that cannot be written, changes nothing.
+        replacement = PDF.unlocked(read_version(self.path, version_id), self.password)
+        try:
+            undo_step = self.pdf.bytes()
+            save_version(self.path, self.pdf.snapshot_bytes(self.password), 'Before restore')
+        except BaseException:
+            replacement.close()
+            raise
+        self.pdf.replace(replacement)
+        self.history.append(undo_step)
         self.history = self.history[-8:]
         self.redo_history.clear()
-        self.pdf.restore(data)
         self.dirty = True
         self.refresh()
         self.status.set('Version restored. Undo to go back, or Save as to keep it.')
@@ -1146,8 +1191,9 @@ class App(tk.Tk):
         window.geometry('640x420')
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Snapshots of this document stay on this computer. Save a version, '
-                             'then restore or compare it later.', style='Muted.TLabel', wraplength=600).pack(anchor='w')
+        ttk.Label(frame, text='Snapshots of this document stay on this computer'
+                             + (", protected with the document's password" if self.password else '')
+                             + '. Save a version, then restore or compare it later.', style='Muted.TLabel', wraplength=600).pack(anchor='w')
         saver = ttk.Frame(frame)
         saver.pack(fill='x', pady=8)
         label = tk.StringVar()
@@ -1170,7 +1216,7 @@ class App(tk.Tk):
                 raise ValueError('Select a version in the list first.')
             return item
         def save():
-            save_version(self.path, self.pdf.doc.tobytes(garbage=4, deflate=True), label.get())
+            save_version(self.path, self.pdf.snapshot_bytes(self.password), label.get())
             label.set('')
             reload()
             self.status.set('Version saved.')
@@ -1183,8 +1229,7 @@ class App(tk.Tk):
         def compare():
             item = selected()
             out = Path(tempfile.mkdtemp()) / 'version-diff.html'
-            self.pdf.compare(str(version_file(self.path, item['id'])), str(out))
-            webbrowser.open(out.resolve().as_uri())
+            self.compare_in_background(str(version_file(self.path, item['id'])), str(out), self.password)
         def delete():
             item = selected()
             delete_version(self.path, item['id'])
@@ -1223,15 +1268,22 @@ class App(tk.Tk):
         targets = [Path(folder) / (Path(p).stem + '-compressed.pdf') for p in paths]
         if len(set(targets)) != len(targets) or any(p.exists() for p in targets):
             raise ValueError('Output names overlap or already exist. Choose unique filenames and a new folder.')
-        def work():
-            for path, target in zip(paths, targets):
-                pdf = PDF(path)
-                try:
-                    pdf.save(target)
-                finally:
-                    pdf.close()
-            return len(paths)
-        self.background(work, lambda n: self.status.set(f'Compressed {n} PDFs. Already optimized files may not shrink.'), 'Compressing PDFs…')
+        passwords, refused = {}, []
+        for path in paths:  # ask here: no dialog may open from the worker thread
+            try:
+                passwords[path] = self.ask_password(path)
+            except Exception:  # refused, or not a PDF that can be opened at all
+                passwords[path] = None
+            if passwords[path] is None:  # skipped and named in the status; the rest go ahead
+                refused.append(path)
+        chosen = [(path, target) for path, target in zip(paths, targets) if path not in refused]
+        def done(result):
+            written, skipped = result
+            names = ', '.join(Path(p).name for p in refused + skipped)
+            self.status.set(f'Compressed {len(written)} PDFs. Already optimized files may not shrink.'
+                            + (f' Skipped: {names}.' if names else ''))
+        self.background(lambda: PDF.compress_files(*zip(*chosen), passwords) if chosen else ([], []),
+                        done, 'Compressing PDFs…')
 
     def optimize(self):
         self.require()
